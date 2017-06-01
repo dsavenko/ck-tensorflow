@@ -63,10 +63,17 @@ tf.app.flags.DEFINE_string(
     'image_dir', './', """Directory with images""")
 tf.app.flags.DEFINE_string(
     'label_dir', './', """Directory with image labels""")
-tf.app.flags.DEFINE_float(
-    'iou_threshold', 0.7, """Threshold for IoU metric to determine false positives""")
 tf.app.flags.DEFINE_string(
     'demo_net', 'squeezeDet', """Neural net architecture.""")
+
+UNASSIGNED = -2
+UNKNOWN = -1
+EASY = 0
+MODERATE = 1
+HARD = 2
+MIN_HEIGHT     = [40, 25, 25]        # minimum height for evaluated groundtruth/detections
+MAX_OCCLUSION  = [0, 1, 2]           # maximum occlusion level of the groundtruth used for evaluation
+MAX_TRUNCATION = [0.15, 0.3, 0.5]    # maximum truncation level of the groundtruth used for evaluation
 
 def bb_intersection_over_union(boxA, boxB):
     # determine the (x, y)-coordinates of the intersection rectangle
@@ -91,17 +98,11 @@ def bb_intersection_over_union(boxA, boxB):
     # return the intersection over union value
     return iou
 
-def my_draw_box(im, box_list, label_list, color=(0,255,0), cdict=None, form='center', label_placement='bottom'):
-    assert form == 'center' or form == 'diagonal', \
-        'bounding box format not accepted: {}.'.format(form)
-
+def my_draw_box(im, box_list, label_list, color=(0,255,0), cdict=None, label_placement='bottom'):
     assert label_placement == 'bottom' or label_placement == 'top', \
         'label_placement format not accepted: {}.'.format(label_placement)
 
     for bbox, label in zip(box_list, label_list):
-        if form == 'center':
-            bbox = bbox_transform(bbox)
-
         xmin, ymin, xmax, ymax = [int(b) for b in bbox]
 
         l = label.split(':')[0] # text before "CLASS: (PROB)"
@@ -118,6 +119,113 @@ def my_draw_box(im, box_list, label_list, color=(0,255,0), cdict=None, form='cen
             cv2.putText(im, label, (xmin, ymax), font, 0.3, c, 1)
         else:
             cv2.putText(im, label, (xmin, ymin), font, 0.3, c, 1)
+
+class Box:
+    def __init__(self, klass, bbox, occlusion=0, truncation=0, prob=0):
+        self.klass = klass
+        self.bbox = bbox
+        self.occlusion = occlusion
+        self.truncation = truncation
+        self.prob = prob
+        self.assigned_difficulty = UNASSIGNED
+
+    def height(self):
+        return self.bbox[3] - self.bbox[1]
+
+    def should_ignore(self, difficulty):
+        return self.occlusion > MAX_OCCLUSION[difficulty] or self.truncation > MAX_TRUNCATION[difficulty] or self.height() < MIN_HEIGHT[difficulty]
+
+    def difficulty(self):
+        if not self.should_ignore(EASY):
+            return EASY
+        if not self.should_ignore(MODERATE):
+            return MODERATE
+        if not self.should_ignore(HARD):
+            return HARD
+        return UNKNOWN
+
+    def inside(self, box):
+        return 
+
+def difficulty_str(difficulty):
+    if difficulty == EASY:
+        return "E"
+    if difficulty == MODERATE:
+        return "M"
+    if difficulty == HARD:
+        return "H"
+    return "?"
+
+def eval_boxes(expected, recognized, dontcare, klass, difficulty):
+    gt = [b for b in expected if b.klass == klass and difficulty == b.difficulty()]
+    # print('diff ' + difficulty_str(difficulty) + ', len gt=' + str(len(gt)) + ', total len gt=' + str(len(expected)))
+    rec = []
+    if UNKNOWN == difficulty:
+        rec = [b for b in recognized if b.klass == klass]
+    else:
+        rec = [b for b in recognized if b.klass == klass and UNASSIGNED == b.assigned_difficulty and b.height() >= MIN_HEIGHT[difficulty]]
+    # print('diff ' + difficulty_str(difficulty) + ', len rec=' + str(len(rec)) + ', total len rec=' + str(len(recognized)))
+    # print('    unassigned len rec=' + str(len([b for b in recognized if b.klass == klass and UNASSIGNED == b.assigned_difficulty])))
+    assigned_rec = [False for b in rec]
+    assigned_gt = [False for b in gt]
+    tp = 0
+    fn = 0
+    for r_index, r_box in enumerate(rec):
+        threshold = 0.7 if 'car' == r_box.klass else 0.5
+
+        for gt_index, gt_box in enumerate(gt):
+            if assigned_gt[gt_index]:
+                continue
+            iou = bb_intersection_over_union(r_box.bbox, gt_box.bbox)
+            if iou >= threshold:
+                assigned_rec[r_index] = True
+                assigned_gt[gt_index] = True
+                r_box.assigned_difficulty = difficulty
+                break
+
+        if not assigned_rec[r_index]:
+            for dc_box in dontcare:
+                iou = bb_intersection_over_union(r_box.bbox, dc_box.bbox)
+                if iou >= threshold:
+                    assigned_rec[r_index] = True
+                    break
+
+        if assigned_rec[r_index]:
+            tp += 1
+        else:
+            fn += 1
+
+    # precision = 0.0
+    # if 0 == len(rec):
+    #     precision = 1 if 0 == len(gt) else 0
+    # else:
+    #     precision = float(true_count) / float(len(rec))
+
+    # recall = 0
+    # if 0 == len(gt):
+    #     recall = 1 if 0 == len(rec) else 0
+    # else:
+    #     recall = float(true_count) / float(len(gt))
+
+    # return (true_count, precision, recall)
+    return (tp, fn, len(rec), len(gt))
+
+class Stat:
+    def __init__(self):
+        self.avg = 0.0
+        self.count = 0
+
+    def add(self, v):
+        self.count += 1
+        self.avg = (self.avg * (self.count - 1) + v) / float(self.count)
+
+def calc_mAP(avg_precision):
+    s = 0.0
+    count = 0
+    for v in avg_precision.values():
+        s += v.avg
+        count += 1
+    return 0 if 0 == count else s / float(count)
 
 def image_demo():
   """Detect image."""
@@ -154,6 +262,9 @@ def image_demo():
     with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
       saver.restore(sess, FLAGS.checkpoint)
 
+      class_names = [k.lower() for k in mc.CLASS_NAMES]
+      avg_precision = dict((k, Stat()) for k in class_names)
+
       d = FLAGS.image_dir
       image_list = sorted([os.path.join(d, f) for f in os.listdir(d) if os.path.isfile(os.path.join(d, f))])
 
@@ -182,6 +293,8 @@ def image_demo():
         final_probs = [final_probs[idx] for idx in keep_idx]
         final_class = [final_class[idx] for idx in keep_idx]
 
+        recognized = [Box(class_names[k], bbox_transform(bbox), prob=p) for k, bbox, p in zip(final_class, final_boxes, final_probs)]
+
         # TODO(bichen): move this color dict to configuration file
         cls2clr = {
             'car': (255, 191, 0),
@@ -191,9 +304,10 @@ def image_demo():
 
         file_name = os.path.split(f)[1]
 
-        expected_classes = []
-        expected_boxes = []
-        class_count = dict((k, 0) for k in mc.CLASS_NAMES)
+        expected = []
+        dontcare = []
+
+        class_count = dict((k, 0) for k in class_names)
         
         if FLAGS.label_dir:
             label_file_name = os.path.join(FLAGS.label_dir, file_name)
@@ -203,38 +317,46 @@ def image_demo():
                 for l in label_lines:
                     parts = l.strip().lower().split(' ')
                     klass = parts[0]
+                    bbox = [float(parts[i]) for i in [4, 5, 6, 7]]
                     if klass in class_count.keys():
                         class_count[klass] += 1
-                        bbox = [float(parts[i]) for i in [4, 5, 6, 7]]
-                        expected_boxes.append(bbox)
-                        expected_classes.append(klass)
+                        b = Box(klass, bbox, truncation=float(parts[1]), occlusion=float(parts[2]))
+                        expected.append(b)
+                    elif klass == 'dontcare':
+                        dontcare.append(Box(klass, bbox))
 
         expected_class_count = class_count
 
+        # Draw dontcare boxes
+        my_draw_box(
+            im, [b.bbox for b in dontcare],
+            ['dontcare' for b in dontcare],
+            label_placement='top', color=(255,255,255)
+        )
+
         # Draw original boxes
         my_draw_box(
-            im, expected_boxes,
-            [k+': (TRUE)' for k in expected_classes],
-            form='diagonal', label_placement='top', color=(200,200,200)
+            im, [b.bbox for b in expected],
+            [b.klass + ': (' + difficulty_str(b.difficulty()) + ')' for b in expected],
+            label_placement='top', color=(200,200,200)
         )
 
         # Draw recognized boxes
         my_draw_box(
-            im, final_boxes,
-            [mc.CLASS_NAMES[idx]+': (%.2f)'% prob \
-                for idx, prob in zip(final_class, final_probs)],
-            cdict=cls2clr,
+            im, [b.bbox for b in recognized],
+            [b.klass + ': (%.2f)' % b.prob for b in recognized],
+            cdict=cls2clr
         )
 
         out_file_name = os.path.join(FLAGS.out_dir, 'out_'+file_name)
         cv2.imwrite(out_file_name, im)
         
         print('File: {}'.format(out_file_name))
-        print('Duration: {} sec'.format(duration))
+        print('Duration: {:.4f} sec'.format(duration))
 
-        class_count = dict((k.lower(), 0) for k in mc.CLASS_NAMES)
+        class_count = dict((k, 0) for k in class_names)
         for k in final_class:
-            class_count[mc.CLASS_NAMES[k].lower()] += 1
+            class_count[class_names[k]] += 1
 
         for k, v in class_count.items():
             print('Recognized {}: {}'.format(k, v))
@@ -242,26 +364,38 @@ def image_demo():
         for k, v in expected_class_count.items():
             print('Expected {}: {}'.format(k, v))
 
-        false_positives_count = dict((k, 0) for k in mc.CLASS_NAMES)
-        threshold = FLAGS.iou_threshold
-        for klass, final_box in zip(final_class, final_boxes):
-            remove_indices = []
-            transformed = bbox_transform(final_box)
-            
-            for i, expected_box in enumerate(expected_boxes):
-                iou = bb_intersection_over_union(transformed, expected_box)
-                if iou >= threshold:
-                    remove_indices.append(i)
+        for k in class_names:
+            eval_boxes(expected, recognized, dontcare, k, UNKNOWN)
+            tp_easy, fn_easy, all_rec_easy, all_gt_easy = eval_boxes(expected, recognized, dontcare, k, EASY)
+            tp_mod, fn_mod, all_rec_mod, all_gt_mod = eval_boxes(expected, recognized, dontcare, k, MODERATE)
+            tp_hard, fn_hard, all_rec_hard, all_gt_hard = eval_boxes(expected, recognized, dontcare, k, HARD)
+            tp = tp_easy + tp_mod + tp_hard
+            all_rec = all_rec_easy + all_rec_mod + all_rec_hard
+            all_gt = all_gt_easy + all_gt_mod + all_gt_hard
+            fp = all_rec - tp
+            fn = fn_easy + fn_mod + fn_hard
+            print('True positive {}: {} easy, {} moderate, {} hard'.format(k, tp_easy, tp_mod, tp_hard))
+            print('False positive {}: {}'.format(k, fp))
 
-            if remove_indices:
-                for to_remove in sorted(remove_indices, reverse=True):
-                    del expected_boxes[to_remove]
+            precision = 0.0
+            if 0 == all_rec:
+                precision = 1.0 if 0 == all_gt else 0.0
             else:
-                false_positives_count[mc.CLASS_NAMES[klass]] += 1
+                precision = float(tp) / float(all_rec)
 
-        for k, v in false_positives_count.items():
-            print('False positive {}: {}'.format(k, v))
+            recall = 0.0
+            if 0 == all_gt:
+                recall = 1.0 if 0 == all_rec else 0.0
+            else:
+                recall = float(tp) / float(all_gt)
 
+            print('Precision {}: {:.2f}'.format(k, precision))
+            print('Recall {}: {:.2f}'.format(k, recall))
+            ap = avg_precision[k]
+            ap.add(precision)
+            print('Rolling AP {}: {:.2f}'.format(k, ap.avg))
+
+        print('Rolling mAP: {:.4f}'.format(calc_mAP(avg_precision)))
         print('')
         sys.stdout.flush()
 
