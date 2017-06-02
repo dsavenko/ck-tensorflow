@@ -1,0 +1,26 @@
+{
+  "check_exit_status": "yes",
+  "deps": {
+    "compiler": {
+      "local": "yes",
+      "name": "C++ compiler",
+      "sort": 0,
+      "tags": "compiler,lang-cpp"
+    }
+  },
+  "customize": {
+    "version": "1.0"
+  },
+  "end_full_path": {
+    "linux": "evaluate-object"
+  }, 
+  "process_script": "install",
+  "soft_uoa": "df3414cb1bda6e86",
+  "suggested_path": "dnn-devkit",
+  "tags": [
+    "tool",
+    "dnn",
+    "devkit",
+    "dnn-devkit"
+  ]
+}

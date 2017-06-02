@@ -71,7 +71,6 @@ def setup(i):
     env[ep]=pl
     env[ep+'_ROOT']=p1
 
-    env[ep+'_SRC']=os.path.join(p1, cus.get('source_dir', 'src'))
+    env[ep+'_EVALUATOR']=fp
 
     return {'return':0, 'bat':s}
-
