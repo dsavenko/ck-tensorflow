@@ -91,17 +91,11 @@ def bb_intersection_over_union(boxA, boxB):
     # return the intersection over union value
     return iou
 
-def my_draw_box(im, box_list, label_list, color=(0,255,0), cdict=None, form='center', label_placement='bottom'):
-    assert form == 'center' or form == 'diagonal', \
-        'bounding box format not accepted: {}.'.format(form)
-
+def my_draw_box(im, box_list, label_list, color=(0,255,0), cdict=None, label_placement='bottom'):
     assert label_placement == 'bottom' or label_placement == 'top', \
         'label_placement format not accepted: {}.'.format(label_placement)
 
     for bbox, label in zip(box_list, label_list):
-        if form == 'center':
-            bbox = bbox_transform(bbox)
-
         xmin, ymin, xmax, ymax = [int(b) for b in bbox]
 
         l = label.split(':')[0] # text before "CLASS: (PROB)"
@@ -118,6 +112,25 @@ def my_draw_box(im, box_list, label_list, color=(0,255,0), cdict=None, form='cen
             cv2.putText(im, label, (xmin, ymax), font, 0.3, c, 1)
         else:
             cv2.putText(im, label, (xmin, ymin), font, 0.3, c, 1)
+
+class Box:
+    def __init__(self, klass, bbox, occlusion=0, truncation=0, alpha=0, prob=0):
+        self.klass = klass
+        self.bbox = bbox
+        self.occlusion = occlusion
+        self.truncation = truncation
+        self.alpha = alpha
+        self.prob = prob
+        self.assigned = False
+
+    def __str__(self):
+        b = self
+        bb = b.bbox
+        return '{} {:.2f} {} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f} {:.2f}'.format(b.klass, b.truncation, b.occlusion, b.alpha, bb[0], bb[1], bb[2], bb[3], b.prob)
+
+def print_boxes(prefix, boxes):
+    for b in boxes:
+        print('{} {}'.format(prefix, b))
 
 def image_demo():
   """Detect image."""
@@ -154,6 +167,7 @@ def image_demo():
     with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
       saver.restore(sess, FLAGS.checkpoint)
 
+      class_names = [k.lower() for k in mc.CLASS_NAMES]
       d = FLAGS.image_dir
       image_list = sorted([os.path.join(d, f) for f in os.listdir(d) if os.path.isfile(os.path.join(d, f))])
 
@@ -182,6 +196,8 @@ def image_demo():
         final_probs = [final_probs[idx] for idx in keep_idx]
         final_class = [final_class[idx] for idx in keep_idx]
 
+        recognized = [Box(class_names[k], bbox_transform(bbox), prob=p) for k, bbox, p in zip(final_class, final_boxes, final_probs)]
+
         # TODO(bichen): move this color dict to configuration file
         cls2clr = {
             'car': (255, 191, 0),
@@ -191,8 +207,9 @@ def image_demo():
 
         file_name = os.path.split(f)[1]
 
-        expected_classes = []
-        expected_boxes = []
+        expected = []
+        dontcare = []
+
         class_count = dict((k, 0) for k in mc.CLASS_NAMES)
         
         if FLAGS.label_dir:
@@ -203,27 +220,28 @@ def image_demo():
                 for l in label_lines:
                     parts = l.strip().lower().split(' ')
                     klass = parts[0]
+                    bbox = [float(parts[i]) for i in [4, 5, 6, 7]]
                     if klass in class_count.keys():
                         class_count[klass] += 1
-                        bbox = [float(parts[i]) for i in [4, 5, 6, 7]]
-                        expected_boxes.append(bbox)
-                        expected_classes.append(klass)
+                        b = Box(klass, bbox, truncation=float(parts[1]), occlusion=float(parts[2]), alpha=float(parts[3]), prob=1)
+                        expected.append(b)
+                    elif klass == 'dontcare':
+                        dontcare.append(Box(klass, bbox))
 
         expected_class_count = class_count
 
         # Draw original boxes
         my_draw_box(
-            im, expected_boxes,
-            [k+': (TRUE)' for k in expected_classes],
-            form='diagonal', label_placement='top', color=(200,200,200)
+            im, [b.bbox for b in expected],
+            [b.klass + ': (TRUE)' for b in expected],
+            label_placement='top', color=(200,200,200)
         )
 
         # Draw recognized boxes
         my_draw_box(
-            im, final_boxes,
-            [mc.CLASS_NAMES[idx]+': (%.2f)'% prob \
-                for idx, prob in zip(final_class, final_probs)],
-            cdict=cls2clr,
+            im, [b.bbox for b in recognized],
+            [b.klass + ': (%.2f)' % b.prob for b in recognized],
+            cdict=cls2clr
         )
 
         out_file_name = os.path.join(FLAGS.out_dir, 'out_'+file_name)
@@ -234,7 +252,7 @@ def image_demo():
 
         class_count = dict((k.lower(), 0) for k in mc.CLASS_NAMES)
         for k in final_class:
-            class_count[mc.CLASS_NAMES[k].lower()] += 1
+            class_count[class_names[k]] += 1
 
         for k, v in class_count.items():
             print('Recognized {}: {}'.format(k, v))
@@ -242,25 +260,24 @@ def image_demo():
         for k, v in expected_class_count.items():
             print('Expected {}: {}'.format(k, v))
 
-        false_positives_count = dict((k, 0) for k in mc.CLASS_NAMES)
+        false_positives_count = dict((k, 0) for k in class_names)
         threshold = FLAGS.iou_threshold
-        for klass, final_box in zip(final_class, final_boxes):
-            remove_indices = []
-            transformed = bbox_transform(final_box)
-            
-            for i, expected_box in enumerate(expected_boxes):
-                iou = bb_intersection_over_union(transformed, expected_box)
+        for recb in recognized:
+            for gtb in [b for b in expected if not b.assigned]:
+                iou = bb_intersection_over_union(recb.bbox, gtb.bbox)
                 if iou >= threshold:
-                    remove_indices.append(i)
+                    gtb.assigned = True
+                    recb.assigned = True
+                    break
 
-            if remove_indices:
-                for to_remove in sorted(remove_indices, reverse=True):
-                    del expected_boxes[to_remove]
-            else:
-                false_positives_count[mc.CLASS_NAMES[klass]] += 1
+            if not recb.assigned:
+                false_positives_count[recb.klass] += 1
 
         for k, v in false_positives_count.items():
             print('False positive {}: {}'.format(k, v))
+
+        print_boxes('Ground truth', expected)
+        print_boxes('Detection', recognized)
 
         print('')
         sys.stdout.flush()
