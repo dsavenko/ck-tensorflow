@@ -276,7 +276,7 @@ def image_demo():
         for k, v in false_positives_count.items():
             print('False positive {}: {}'.format(k, v))
 
-        print_boxes('Ground truth', expected)
+        print_boxes('Ground truth', expected + dontcare)
         print_boxes('Detection', recognized)
 
         print('')
